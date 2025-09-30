@@ -3,9 +3,9 @@
 #include <cublas_v2.h>
 #include <cuda.h>
 #include <iostream>
-#include <chrono>
+#include <cassert>
 
-#define BLOCKSIZE 32
+#define BLOCKSIZE 64
 
 //grid=> block=> thread
 __global__ void testMul(int M, int N, int K, float * A, float * B, float * C, float alpha, float beta) {
@@ -38,36 +38,61 @@ __global__ void naive(int M, int N, int K, float * A, float * B, float * C, floa
   }
 }
 
+// Let's do the 1-d thread tiling, if instead of 
+// BM * BK threads
+// We have BM x BK threads 
+// Then what happens?
+// Ok. Nothing ever happens.
+
 __global__ void testTiledMatrix(int M, int N, int K, float * A, float * B, float * C) {
     int bx = blockIdx.x;
     int by = blockIdx.y;
 
     const int BM = BLOCKSIZE;
     const int BN = BLOCKSIZE;
-    const int BK = BLOCKSIZE;
+    constexpr int BK =8;
+    const int TM = 8;
+
+    const uint totalResultsBlocktile = BM * BN;
+  // A thread is responsible for calculating TM elements in the blocktile
+    const uint numThreadsBlocktile = totalResultsBlocktile / TM;
+
+  // ResultsPerBlock / ResultsPerThread == ThreadsPerBlock
+     assert(numThreadsBlocktile == blockDim.x);
+
     
     // Convert 1D thread index to 2D coordinates within block
     int tx = threadIdx.x % BN;  // column in tile
     int ty = threadIdx.x / BN;  // row in tile
 
+    assert(blockDim.x == BM * BK);
+
     // Shared memory for tiles
-    __shared__ float As[BLOCKSIZE * BLOCKSIZE];
-    __shared__ float Bs[BLOCKSIZE * BLOCKSIZE];
+    __shared__ float As[BM * BK];
+    __shared__ float Bs[BK * BN];
 
     // Move to current block position
     A = &A[by * BM * K];        // Start of block row in A
     B = &B[bx * BN];            // Start of block column in B  
     C = &C[by * BM * N + bx * BN]; // Start of block in C
 
-    float tmp = 0.0f;
-    
+    //these are just used for loading 
+    const uint innerColA = threadIdx.x % BK; // warp-level GMEM coalescing
+    const uint innerRowA = threadIdx.x / BK;
+    const uint innerColB = threadIdx.x % BN; // warp-level GMEM coalescing
+    const uint innerRowB = threadIdx.x / BN;
+
+    float threadRes[TM] = {}; 
+
     // Loop over K dimension in tiles
     for (int k = 0; k < K; k += BK) {
         // Load tile from A and B simultaneously
         // No boundary checks needed for square matrices divisible by BLOCKSIZE
-        As[ty * BK + tx] = A[ty * K + tx];
-        Bs[ty * BN + tx] = B[ty * N + tx];
-        
+        //A[ty][tx] (does it go from 0->k)
+        //
+        As[innerRowA * BK + innerColA] = A[innerRowA * K + innerColA];
+        Bs[innerRowB * BN + innerColB] = B[innerRowB * N + innerColB];
+
         // Synchronize to ensure all data is loaded
         __syncthreads();
         
@@ -76,8 +101,12 @@ __global__ void testTiledMatrix(int M, int N, int K, float * A, float * B, float
         B += BK * N;
         
         // Compute partial dot product using loaded tiles
+#pragma unroll
         for (int i = 0; i < BK; i++) {
-            tmp += As[ty * BK + i] * Bs[i * BN + tx];
+            float tmpB = Bs[i*BN + tx];
+            for(int res_idx = 0; res_idx < TM; res_idx++) {
+                threadRes[res_idx] += As[(ty*TM + res_idx)*BK + i] * tmpB;
+            }
         }
         
         // Synchronize before loading next tiles
@@ -85,7 +114,10 @@ __global__ void testTiledMatrix(int M, int N, int K, float * A, float * B, float
     }
     
     // Write result to global memory - no boundary check needed
-    C[ty * N + tx] = tmp;
+#pragma unroll
+    for(int i = 0 ; i < TM; ++i) {
+        C[(ty*TM + i)* N + tx] = threadRes[i];
+    }
 }
 
 int main() {
@@ -123,11 +155,9 @@ int main() {
     cudaEventRecord(start);
 
 
-    float alpha = 1.0f;
-    float beta = 0.0f;
     // For 1D thread blocks that map to 2D coordinates
     // Each block has BLOCKSIZE*BLOCKSIZE threads arranged as 1D
-    dim3 threadsPerBlock(BLOCKSIZE * BLOCKSIZE, 1);
+    dim3 threadsPerBlock(BLOCKSIZE * 8, 1);
     dim3 gridDim((M + BLOCKSIZE - 1) / BLOCKSIZE, (N + BLOCKSIZE - 1) / BLOCKSIZE);
     std::cout << "Running custom tiled kernel..." << std::endl;
     testTiledMatrix<<<gridDim, threadsPerBlock>>>(M, N, K, a, b, c);
